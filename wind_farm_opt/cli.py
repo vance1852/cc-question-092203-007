@@ -18,14 +18,15 @@ from .core.wind_resource import WindResource
 from .core.wake import WakeModel
 from .constraints.boundary import SiteBoundary
 from .farm.aep import AEPCalculator, FarmResult
+from .io import DataImportError
 from .optimization.baseline import generate_grid_layout
 from .optimization.ga import GeneticAlgorithm, GAConfig
 from .optimization.pso import ParticleSwarmOptimizer, PSOConfig
 from .economy.costs import (
     EconomicAnalyzer,
     EconomicResult,
-    get_default_turbine_cost,
     get_default_farm_cost,
+    get_turbine_cost,
 )
 from .visualization.plotting import (
     plot_farm_layout,
@@ -43,12 +44,14 @@ class WindFarmOptimizerCLI:
 
     def __init__(self, config: WindFarmConfig) -> None:
         self.config = config
-        self._setup_output_dir()
 
+        # 先加载外部数据（可能因 CSV 错误失败），成功后再创建输出目录
         self.turbines = config.create_turbines()
         self.boundary = config.create_boundary()
         self.wind_resource = config.create_wind_resource()
         self.wake_model = config.create_wake_model()
+
+        self._setup_output_dir()
 
         self.rotor_diameters = np.array([t.rotor_diameter for t in self.turbines])
         self.rated_powers = np.array([t.rated_power for t in self.turbines])
@@ -60,6 +63,16 @@ class WindFarmOptimizerCLI:
             wake_model=self.wake_model,
             wake_superposition=config.superposition_method,
         )
+
+        # 外部 CSV 数据来源指纹（去重，按引用路径）
+        self.data_sources: dict[str, dict] = {}
+        wr_prov = getattr(self.wind_resource, "provenance", None)
+        if wr_prov is not None:
+            self.data_sources[f"wind_resource:{wr_prov.path}"] = wr_prov.to_dict()
+        for turb in {id(t): t for t in self.turbines}.values():
+            prov = getattr(turb, "provenance", None)
+            if prov is not None:
+                self.data_sources[f"turbine:{prov.path}"] = prov.to_dict()
 
         self.baseline_positions: Optional[np.ndarray] = None
         self.baseline_result: Optional[FarmResult] = None
@@ -191,7 +204,7 @@ class WindFarmOptimizerCLI:
         else:
             result = self.optimized_result
 
-        turbine_cost = get_default_turbine_cost(self.config.turbine_model)
+        turbine_cost = get_turbine_cost(self.config.turbine_model)
         farm_cost = get_default_farm_cost()
         farm_cost.discount_rate = self.config.economic.discount_rate
 
@@ -244,7 +257,7 @@ class WindFarmOptimizerCLI:
         rng = np.random.default_rng(self.config.optimization.seed)
         original_n = self.config.n_turbines
 
-        turbine_cost = get_default_turbine_cost(self.config.turbine_model)
+        turbine_cost = get_turbine_cost(self.config.turbine_model)
         farm_cost = get_default_farm_cost()
         analyzer = EconomicAnalyzer(
             turbine_cost=turbine_cost,
@@ -414,6 +427,9 @@ class WindFarmOptimizerCLI:
             },
         }
 
+        if self.data_sources:
+            results["data_sources"] = list(self.data_sources.values())
+
         if self.baseline_result is not None:
             results["baseline"] = {
                 "positions": self.baseline_positions.tolist() if self.baseline_positions is not None else None,
@@ -485,10 +501,36 @@ class WindFarmOptimizerCLI:
             json.dump(results, f, indent=2, ensure_ascii=False)
 
         config_path = os.path.join(output_dir, "config.json")
-        self.config.to_json(config_path)
+        self._save_config_snapshot(config_path)
 
         print(f"结果已保存到: {os.path.abspath(results_path)}")
         print(f"配置已保存到: {os.path.abspath(config_path)}")
+
+    def _save_config_snapshot(self, config_path: str) -> None:
+        """保存配置快照。
+
+        快照与 results.json 一起归档，可能被复制到其他目录，
+        因此把其中引用的外部 CSV 相对路径解析为绝对路径，
+        保证快照可独立复现；内存中的原配置保持相对路径不变。
+        """
+        from pathlib import Path
+        import copy
+
+        snapshot = copy.deepcopy(self.config)
+        base = self.config.config_dir
+
+        def _absolutize(params: dict) -> None:
+            ref = params.get("path")
+            if base and ref and not Path(ref).expanduser().is_absolute():
+                params["path"] = str((Path(base) / ref).resolve())
+
+        if self.config.wind_resource_type.lower() in ("csv", "external", "sectors"):
+            _absolutize(snapshot.wind_resource_params)
+        if self.config.turbine_model.lower() in ("custom", "csv", "external"):
+            _absolutize(snapshot.turbine_params)
+
+        snapshot.config_dir = None
+        snapshot.to_json(config_path)
 
     def run_full_analysis(
         self,
@@ -577,8 +619,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--turbine",
         type=str,
         default=None,
-        choices=["V126-3.45MW", "V164-9.5MW"],
-        help="风机型号",
+        help="风机型号: V126-3.45MW、V164-9.5MW 或 custom（配合配置文件中的 turbine_params.path 加载 CSV）",
     )
 
     parser.add_argument(
@@ -782,7 +823,12 @@ def main() -> int:
     if args.no_economic:
         config.economic.enable_analysis = False
 
-    cli = WindFarmOptimizerCLI(config)
+    try:
+        cli = WindFarmOptimizerCLI(config)
+    except DataImportError as e:
+        print(f"\n外部数据导入失败: {e.format_message()}", file=sys.stderr)
+        return 1
+
     cli._min_turbines = args.min_turbines
     cli._max_turbines = args.max_turbines
 
@@ -796,6 +842,9 @@ def main() -> int:
             save=True,
         )
         return 0
+    except DataImportError as e:
+        print(f"\n外部数据导入失败: {e.format_message()}", file=sys.stderr)
+        return 1
     except Exception as e:
         print(f"\n错误: {e}", file=sys.stderr)
         import traceback

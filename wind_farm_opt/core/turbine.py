@@ -1,7 +1,7 @@
 """风机模型定义。"""
 
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 
@@ -19,7 +19,8 @@ class Turbine:
     rotor_diameter : float
         转子直径 (m)
     thrust_coefficient : float
-        推力系数 Ct (0-1)
+        代表性推力系数 Ct (0-1]，取曲线最大值或额定点值；
+        未提供 ``thrust_curve`` 时同时作为常数 Ct 使用
     power_curve : np.ndarray
         功率曲线，形状为 (N, 2)，第一列为风速 (m/s)，第二列为功率 (kW)
     cut_in_speed : float
@@ -32,6 +33,12 @@ class Turbine:
         额定功率 (kW)，从功率曲线自动推断
     position : Optional[Tuple[float, float]]
         风机位置 (x, y) (m)，可选
+    thrust_curve : Optional[np.ndarray]
+        随风速变化的推力系数曲线，形状为 (M, 2)，
+        第一列风速 (m/s) 须严格单调递增，第二列 Ct ∈ [0, 1)；
+        为 None 时全程使用常数 ``thrust_coefficient``
+    provenance : Optional[Any]
+        外部数据来源指纹（``io.SourceFingerprint``），内置机组为 None
     """
 
     name: str
@@ -40,6 +47,8 @@ class Turbine:
     thrust_coefficient: float
     power_curve: np.ndarray
     position: Optional[Tuple[float, float]] = None
+    thrust_curve: Optional[np.ndarray] = None
+    provenance: Optional[Any] = field(default=None, repr=False, compare=False)
 
     cut_in_speed: float = field(init=False)
     rated_speed: float = field(init=False)
@@ -50,6 +59,17 @@ class Turbine:
         self.power_curve = np.asarray(self.power_curve, dtype=np.float64)
         if self.power_curve.ndim != 2 or self.power_curve.shape[1] != 2:
             raise ValueError("功率曲线必须是形状为 (N, 2) 的数组")
+
+        if self.thrust_curve is not None:
+            self.thrust_curve = np.asarray(self.thrust_curve, dtype=np.float64)
+            if self.thrust_curve.ndim != 2 or self.thrust_curve.shape[1] != 2:
+                raise ValueError("推力系数曲线必须是形状为 (N, 2) 的数组")
+            ct_speeds = self.thrust_curve[:, 0]
+            if len(ct_speeds) < 2 or np.any(np.diff(ct_speeds) <= 0):
+                raise ValueError("推力系数曲线的风速列必须严格单调递增且至少 2 个点")
+            ct_values = self.thrust_curve[:, 1]
+            if np.any(ct_values < 0.0) or np.any(ct_values >= 1.0):
+                raise ValueError("推力系数曲线的 Ct 值必须在 [0, 1) 范围内")
 
         self._derive_parameters()
 
@@ -92,6 +112,36 @@ class Turbine:
         ws = np.asarray(wind_speed, dtype=np.float64)
         result = np.interp(ws, self.power_curve[:, 0], self.power_curve[:, 1],
                           left=0.0, right=0.0)
+        return result if ws.ndim > 0 else float(result)
+
+    def thrust_at(self, wind_speed: float | np.ndarray) -> float | np.ndarray:
+        """根据来流风速计算推力系数 Ct。
+
+        有推力曲线时在曲线上线性插值（曲线范围之外取端点值）；
+        无曲线时返回常数 ``thrust_coefficient``。
+
+        Parameters
+        ----------
+        wind_speed : float | np.ndarray
+            来流风速 (m/s)
+
+        Returns
+        -------
+        float | np.ndarray
+            推力系数，与输入形状一致
+        """
+        if self.thrust_curve is None:
+            ws = np.asarray(wind_speed, dtype=np.float64)
+            result = np.full_like(ws, self.thrust_coefficient)
+            return result if ws.ndim > 0 else float(self.thrust_coefficient)
+        ws = np.asarray(wind_speed, dtype=np.float64)
+        result = np.interp(
+            ws,
+            self.thrust_curve[:, 0],
+            self.thrust_curve[:, 1],
+            left=float(self.thrust_curve[0, 1]),
+            right=float(self.thrust_curve[-1, 1]),
+        )
         return result if ws.ndim > 0 else float(result)
 
     @property

@@ -1,7 +1,7 @@
 """风资源模型。"""
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 
@@ -100,8 +100,21 @@ class WindResource:
     包含按风向扇区划分的风玫瑰数据。
     """
 
-    def __init__(self, sectors: list[WindSector]) -> None:
+    def __init__(
+        self,
+        sectors: list[WindSector],
+        provenance: Any = None,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        sectors : list[WindSector]
+            风向扇区列表（可为不等宽）
+        provenance : Any
+            外部数据来源指纹（``io.SourceFingerprint``），内置风资源为 None
+        """
         self.sectors = sectors
+        self.provenance = provenance
         self._validate()
 
     def _validate(self) -> None:

@@ -136,6 +136,7 @@ class AEPCalculator:
         self._hub_heights = np.array([t.hub_height for t in turbines], dtype=np.float64)
 
         self._precompute_power_lookups()
+        self._precompute_thrust_lookups()
 
     def _precompute_power_lookups(self) -> None:
         """预计算每台风机的功率查找表。"""
@@ -146,6 +147,19 @@ class AEPCalculator:
 
         for i, turb in enumerate(self.turbines):
             self._power_lookup[i] = turb.power(self._speed_centers)
+
+    def _precompute_thrust_lookups(self) -> None:
+        """预计算每台风机在各风速 bin 的推力系数查找表。
+
+        有 Ct 曲线的自定义机组使用随风速变化的 Ct；
+        内置常数 Ct 机组对应行退化为常数，结果与旧版完全一致。
+        """
+        n_turb = len(self.turbines)
+        n_speed = len(self._speed_centers)
+
+        self._thrust_lookup = np.zeros((n_turb, n_speed), dtype=np.float64)
+        for i, turb in enumerate(self.turbines):
+            self._thrust_lookup[i] = turb.thrust_at(self._speed_centers)
 
     def _compute_wake_deficit_field(
         self,
@@ -164,10 +178,9 @@ class AEPCalculator:
         Returns
         -------
         np.ndarray
-            速度亏损数组 (N_turb,)，每个元素为该风机在该风向下的等效速度亏损
+            速度亏损数组 (N_turb, N_speed)；
+            常数 Ct 机组各风速列相同，等效于旧版 (N_turb,) 结果
         """
-        n = positions.shape[0]
-
         wind_rad = np.deg2rad(270.0 - wind_direction)
         wind_vec = np.array([np.cos(wind_rad), np.sin(wind_rad)])
 
@@ -197,19 +210,24 @@ class AEPCalculator:
             self._rotor_diameters[:, np.newaxis],
         )
 
+        # Ct 随风速变化：(上游 i, 下游 j, 风速 bin) 三维广播
+        ct_3d = self._thrust_lookup[:, np.newaxis, :]
         peak_deficit = self.wake_model.velocity_deficit(
-            downstream_dist,
-            self._rotor_diameters[:, np.newaxis],
-            self._thrust_coefficients[:, np.newaxis],
+            downstream_dist[:, :, np.newaxis],
+            self._rotor_diameters[:, np.newaxis, np.newaxis],
+            ct_3d,
         )
 
         radial_factor = self.wake_model.radial_profile(cross_dist, wr)
-        deficit_matrix = peak_deficit * radial_factor
-        deficit_matrix = np.where(downstream_mask, deficit_matrix, 0.0)
+        deficit_matrix = peak_deficit * radial_factor[:, :, np.newaxis]
+        deficit_matrix = np.where(
+            downstream_mask[:, :, np.newaxis], deficit_matrix, 0.0
+        )
 
         total_deficit = superpose_wakes(
             deficit_matrix,
             method=self.wake_superposition,
+            axis=0,
         )
 
         return total_deficit
@@ -249,7 +267,7 @@ class AEPCalculator:
         n_turb = len(self.turbines)
         n_speed = len(self._speed_centers)
 
-        effective_speeds = self._speed_centers[np.newaxis, :] * (1.0 - total_deficit[:, np.newaxis])
+        effective_speeds = self._speed_centers[np.newaxis, :] * (1.0 - total_deficit)
 
         net_power = np.zeros((n_turb, n_speed))
         for i in range(n_turb):
@@ -322,15 +340,18 @@ class AEPCalculator:
                 cross_dist = dist * np.sqrt(np.clip(1.0 - along_wind ** 2, 0.0, None))
 
                 wr = self.wake_model.wake_radius(downstream_dist, self._rotor_diameters[i])
+                # 上游机组 i 的 Ct 随风速 bin 变化
+                ct_by_speed = self._thrust_lookup[i]
                 peak_def = self.wake_model.velocity_deficit(
                     downstream_dist,
                     self._rotor_diameters[i],
-                    self._thrust_coefficients[i],
+                    ct_by_speed,
                 )
                 radial_factor = self.wake_model.radial_profile(cross_dist, wr)
                 deficit_i_on_j = peak_def * radial_factor
 
-                if deficit_i_on_j <= 0.001:
+                # 该风速 bin 下亏损过小则跳过（向量化后取最大亏损判断）
+                if np.max(deficit_i_on_j) <= 0.001:
                     continue
 
                 effective_speeds = self._speed_centers * (1.0 - deficit_i_on_j)
@@ -477,7 +498,7 @@ class AEPCalculator:
 
             total_deficit = self._compute_wake_deficit_field(positions, wind_dir)
 
-            effective_speeds = self._speed_centers[np.newaxis, :] * (1.0 - total_deficit[:, np.newaxis])
+            effective_speeds = self._speed_centers[np.newaxis, :] * (1.0 - total_deficit)
 
             for i in range(n_turb):
                 power = np.interp(

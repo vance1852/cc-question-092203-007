@@ -474,3 +474,31 @@ def get_default_farm_cost() -> FarmCostModel:
         discount_rate=0.06,
         inflation_rate=0.025,
     )
+
+
+def get_turbine_cost(
+    model: str = "V164-9.5MW",
+    rated_power_MW: Optional[float] = None,
+) -> TurbineCostModel:
+    """获取风机造价模型。
+
+    内置型号使用厂商档位单价；未知/自定义机型（如外部 CSV 导入的机组）
+    回退到与容量相关的通用单价，保证经济性分析不中断。
+
+    Parameters
+    ----------
+    model : str
+        风机型号
+    rated_power_MW : Optional[float]
+        自定义机型的额定功率 (MW)，仅用于模型记录
+    """
+    if model in ("V164-9.5MW", "V126-3.45MW"):
+        return get_default_turbine_cost(model)
+
+    return TurbineCostModel(
+        turbine_model=model,
+        capital_cost_per_MW=600.0,
+        installation_cost_per_MW=75.0,
+        o_and_m_cost_per_MW_per_year=16.0,
+        design_lifetime=25.0,
+    )

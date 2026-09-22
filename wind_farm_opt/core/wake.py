@@ -97,16 +97,20 @@ class JensenWake(WakeModel):
         thrust_coefficient: float,
     ) -> float | np.ndarray:
         dist = np.asarray(distance, dtype=np.float64)
+        ct = np.asarray(thrust_coefficient, dtype=np.float64)
         d0 = rotor_diameter
+        scalar_input = dist.ndim == 0 and ct.ndim == 0
 
         with np.errstate(divide="ignore", invalid="ignore"):
             ratio = d0 / (d0 + 2.0 * self.wake_decay * dist)
-            deficit = 1.0 - np.sqrt(1.0 - thrust_coefficient) * ratio ** 2
+            deficit = 1.0 - np.sqrt(1.0 - ct) * ratio ** 2
 
+        # Ct=0（如自定义 Ct 曲线在切出风速附近）时无尾流
+        deficit = np.where(ct <= 0.0, 0.0, deficit)
         deficit = np.where(dist <= 0, 0.0, deficit)
         deficit = np.clip(deficit, 0.0, 1.0)
 
-        return deficit if dist.ndim > 0 else float(deficit)
+        return float(deficit) if scalar_input else deficit
 
     def wake_radius(
         self,
@@ -149,8 +153,9 @@ class GaussianWake(WakeModel):
         thrust_coefficient: float,
     ) -> float | np.ndarray:
         dist = np.asarray(distance, dtype=np.float64)
+        ct = np.asarray(thrust_coefficient, dtype=np.float64)
         d0 = rotor_diameter
-        ct = thrust_coefficient
+        scalar_input = dist.ndim == 0 and ct.ndim == 0
 
         beta = 0.5 * (1.0 + np.sqrt(1.0 - ct)) / np.sqrt(1.0 - ct)
 
@@ -171,7 +176,7 @@ class GaussianWake(WakeModel):
         peak_deficit = np.where(dist <= 0, 0.0, peak_deficit)
         peak_deficit = np.clip(peak_deficit, 0.0, 1.0)
 
-        return peak_deficit if dist.ndim > 0 else float(peak_deficit)
+        return float(peak_deficit) if scalar_input else peak_deficit
 
     def wake_radius(
         self,
@@ -209,6 +214,7 @@ class GaussianWake(WakeModel):
 def superpose_wakes(
     deficits: np.ndarray,
     method: str = "sum_of_squares",
+    axis: int = 0,
 ) -> np.ndarray:
     """叠加多个尾流的速度亏损。
 
@@ -218,18 +224,20 @@ def superpose_wakes(
         每个上游风机产生的速度亏损数组，形状为 (N_upstream, ...)
     method : str
         叠加方法："sum_of_squares"（平方和，推荐）或 "linear"（线性叠加）
+    axis : int
+        沿哪个轴对上游风机求和，默认 0
 
     Returns
     -------
     np.ndarray
-        叠加后的总速度亏损，形状为 (...)
+        叠加后的总速度亏损
     """
     deficits = np.asarray(deficits, dtype=np.float64)
 
     if method == "sum_of_squares":
-        total_deficit = np.sqrt(np.sum(deficits ** 2, axis=0))
+        total_deficit = np.sqrt(np.sum(deficits ** 2, axis=axis))
     elif method == "linear":
-        total_deficit = np.sum(deficits, axis=0)
+        total_deficit = np.sum(deficits, axis=axis)
     else:
         raise ValueError(f"未知的尾流叠加方法: {method}")
 
