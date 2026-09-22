@@ -1,0 +1,39 @@
+{
+  "n_turbines": 12,
+  "turbine_model": "custom",
+  "custom_turbine": {
+    "name": "Demo-3.0MW-D130",
+    "hub_height": 90.0,
+    "rotor_diameter": 130.0,
+    "curve_csv": "turbine_curve.csv",
+    "power_unit": "auto"
+  },
+  "wake_model": "jensen",
+  "wake_decay": 0.07,
+  "superposition_method": "sum_of_squares",
+  "boundary_type": "rectangular",
+  "boundary_params": {"width": 4000, "height": 4000, "center_x": 0, "center_y": 0},
+  "wind_resource_type": "external",
+  "wind_resource_params": {
+    "csv_path": "wind_sectors.csv",
+    "frequency_normalization": "strict"
+  },
+  "optimization": {
+    "algorithm": "ga",
+    "population_size": 20,
+    "max_iterations": 30,
+    "min_spacing_multiple": 5.0,
+    "seed": 42
+  },
+  "visualization": {
+    "save_dir": "output_external",
+    "save_plots": true,
+    "show_plots": false,
+    "plot_wake_heatmap": true
+  },
+  "economic": {
+    "electricity_price": 0.45,
+    "discount_rate": 0.06,
+    "enable_analysis": true
+  }
+}

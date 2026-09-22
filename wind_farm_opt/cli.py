@@ -24,6 +24,7 @@ from .optimization.pso import ParticleSwarmOptimizer, PSOConfig
 from .economy.costs import (
     EconomicAnalyzer,
     EconomicResult,
+    TurbineCostModel,
     get_default_turbine_cost,
     get_default_farm_cost,
 )
@@ -52,7 +53,18 @@ class WindFarmOptimizerCLI:
 
         self.rotor_diameters = np.array([t.rotor_diameter for t in self.turbines])
         self.rated_powers = np.array([t.rated_power for t in self.turbines])
-        self.thrust_coefficients = np.array([t.thrust_coefficient for t in self.turbines])
+        # 恒定 Ct 直接使用；推力系数曲线机组取全场平均风速下的代表 Ct
+        # （仅用于单风向尾流热力图，AEP 积分中仍逐风速使用完整 Ct 曲线）
+        ref_speed = self.wind_resource.overall_mean_speed
+        self.thrust_coefficients = np.array(
+            [
+                t.thrust_coefficient
+                if t.thrust_coefficient is not None
+                else t.thrust_coefficient_at(ref_speed)
+                for t in self.turbines
+            ],
+            dtype=np.float64,
+        )
 
         self.aep_calc = AEPCalculator(
             turbines=self.turbines,
@@ -75,6 +87,82 @@ class WindFarmOptimizerCLI:
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
         print(f"输出目录: {os.path.abspath(output_dir)}")
+
+    def _get_turbine_cost(self):
+        """获取机组造价模型；自定义机型使用按容量线性的通用造价。"""
+        if self.config.turbine_model.lower() == "custom":
+            rated_mw = self.turbines[0].rated_power / 1e3
+            return TurbineCostModel(
+                turbine_model=self.config.turbine_model,
+                capital_cost_per_MW=600.0,
+                installation_cost_per_MW=75.0,
+                o_and_m_cost_per_MW_per_year=16.0,
+                design_lifetime=25.0,
+            )
+        return get_default_turbine_cost(self.config.turbine_model)
+
+    def _data_source_summary(self) -> dict:
+        """构建外部数据来源摘要（含可重复识别的指纹），用于结果输出。"""
+        summary: dict = {}
+
+        wr = self.wind_resource
+        if wr is not None and wr.is_external:
+            src = wr.source
+            summary["wind_resource"] = {
+                "source": "external_csv",
+                "path": src["path"],
+                "resolved_path": src["resolved_path"],
+                "fingerprint_sha256": src["fingerprint"],
+                "byte_size": src["byte_size"],
+                "n_sectors": src["n_sectors"],
+                "unequal_widths": src["unequal_widths"],
+                "sector_widths_deg": src["sector_widths"],
+                "crosses_zero_sector_rows": src["crosses_zero_sectors"],
+                "frequency_input": src["frequency_input"],
+                "raw_frequency_sum": src["raw_frequency_sum"],
+                "frequency_normalization": src["frequency_normalization"],
+                "normalization_note": src["normalization_note"],
+                "derived": {
+                    "weibull_c_from_mean_k_rows": src["derived_c_rows"],
+                    "mean_from_weibull_rows": src["derived_mean_rows"],
+                    "default_k_rows": src["default_k_rows"],
+                    "k_solved_from_mean_c_rows": src["solved_k_rows"],
+                },
+            }
+        else:
+            summary["wind_resource"] = {"source": "builtin"}
+
+        first = self.turbines[0] if self.turbines else None
+        if first is not None and getattr(first, "source", None) is not None:
+            src = first.source
+            summary["turbine"] = {
+                "source": "external_csv",
+                "name": src["name"],
+                "files": [
+                    {
+                        "role": f["role"],
+                        "path": f["path"],
+                        "resolved_path": f["resolved_path"],
+                        "fingerprint_sha256": f["fingerprint"],
+                        "byte_size": f["byte_size"],
+                        "n_rows": f["n_rows"],
+                    }
+                    for f in src["files"]
+                ],
+                "power_unit_normalized_to": src["power_unit"],
+                "rated_power_kw": src["rated_power_kw"],
+                "cut_in_speed": src["cut_in_speed"],
+                "rated_speed": src["rated_speed"],
+                "cut_out_speed": src["cut_out_speed"],
+                "thrust_coefficient": src["thrust"],
+            }
+        else:
+            summary["turbine"] = {
+                "source": "builtin",
+                "name": self.config.turbine_model,
+            }
+
+        return summary
 
     def _print_header(self, title: str) -> None:
         print("\n" + "=" * 60)
@@ -191,7 +279,7 @@ class WindFarmOptimizerCLI:
         else:
             result = self.optimized_result
 
-        turbine_cost = get_default_turbine_cost(self.config.turbine_model)
+        turbine_cost = self._get_turbine_cost()
         farm_cost = get_default_farm_cost()
         farm_cost.discount_rate = self.config.economic.discount_rate
 
@@ -244,7 +332,7 @@ class WindFarmOptimizerCLI:
         rng = np.random.default_rng(self.config.optimization.seed)
         original_n = self.config.n_turbines
 
-        turbine_cost = get_default_turbine_cost(self.config.turbine_model)
+        turbine_cost = self._get_turbine_cost()
         farm_cost = get_default_farm_cost()
         analyzer = EconomicAnalyzer(
             turbine_cost=turbine_cost,
@@ -408,6 +496,7 @@ class WindFarmOptimizerCLI:
                 "wake_model": self.config.wake_model,
                 "min_spacing_multiple": self.config.optimization.min_spacing_multiple,
             },
+            "data_sources": self._data_source_summary(),
             "site": {
                 "area_km2": float(self.boundary.area / 1e6),
                 "mean_wind_speed": float(self.wind_resource.overall_mean_speed),
@@ -508,6 +597,21 @@ class WindFarmOptimizerCLI:
         print(f"  平均风速: {self.wind_resource.overall_mean_speed:.2f} m/s")
         print(f"  场地面积: {self.boundary.area / 1e6:.2f} km²")
 
+        sources = self._data_source_summary()
+        wr_src = sources["wind_resource"]
+        if wr_src["source"] == "external_csv":
+            print(
+                f"  风资源: 外部CSV {os.path.basename(wr_src['path'])} "
+                f"({wr_src['n_sectors']} 扇区, 指纹 {wr_src['fingerprint_sha256'][:12]})"
+            )
+        t_src = sources["turbine"]
+        if t_src["source"] == "external_csv":
+            fp = t_src["files"][0]["fingerprint_sha256"][:12] if t_src["files"] else "-"
+            print(
+                f"  机组数据: 外部CSV {t_src['name']} "
+                f"(额定 {t_src['rated_power_kw'] / 1e3:.2f} MW, 指纹 {fp})"
+            )
+
         if run_baseline:
             self.run_baseline()
 
@@ -578,7 +682,7 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         choices=["V126-3.45MW", "V164-9.5MW"],
-        help="风机型号",
+        help="风机型号（自定义机组请在配置文件中设置 turbine_model=custom 与 custom_turbine）",
     )
 
     parser.add_argument(
@@ -782,11 +886,11 @@ def main() -> int:
     if args.no_economic:
         config.economic.enable_analysis = False
 
-    cli = WindFarmOptimizerCLI(config)
-    cli._min_turbines = args.min_turbines
-    cli._max_turbines = args.max_turbines
-
     try:
+        cli = WindFarmOptimizerCLI(config)
+        cli._min_turbines = args.min_turbines
+        cli._max_turbines = args.max_turbines
+
         cli.run_full_analysis(
             run_baseline=True,
             run_opt=not args.no_optimization,
@@ -797,6 +901,12 @@ def main() -> int:
         )
         return 0
     except Exception as e:
+        from .io.csv_import import DataImportError
+        if isinstance(e, DataImportError):
+            print("\n外部数据导入失败：", file=sys.stderr)
+            for problem in e.problems:
+                print(f"  - {problem}", file=sys.stderr)
+            return 1
         print(f"\n错误: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()

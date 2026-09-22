@@ -1,7 +1,7 @@
 """风资源模型。"""
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Any
 
 import numpy as np
 
@@ -74,6 +74,10 @@ class WindSector:
         威布尔形状参数 k
     weibull_c : float
         威布尔尺度参数 c (m/s)
+    direction_start : float, optional
+        扇区起始角度 [0, 360)，默认由中心与宽度推导
+    direction_end : float, optional
+        扇区结束角度 [0, 360)；结束角可能等于 0.0 表示跨零扇区
     """
 
     direction_center: float
@@ -82,6 +86,8 @@ class WindSector:
     mean_speed: float
     weibull_k: float
     weibull_c: float
+    direction_start: Optional[float] = None
+    direction_end: Optional[float] = None
 
     def __post_init__(self) -> None:
         if not (0.0 <= self.frequency <= 1.0):
@@ -92,16 +98,49 @@ class WindSector:
             raise ValueError(f"威布尔k参数必须大于0，当前为 {self.weibull_k}")
         if self.weibull_c <= 0:
             raise ValueError(f"威布尔c参数必须大于0，当前为 {self.weibull_c}")
+        if not (0.0 < self.direction_width <= 360.0):
+            raise ValueError(f"扇区宽度必须在 (0, 360] 范围内，当前为 {self.direction_width}")
+
+        if self.direction_start is None:
+            half = self.direction_width / 2.0
+            self.direction_start = (self.direction_center - half) % 360.0
+        else:
+            self.direction_start = float(self.direction_start) % 360.0
+
+        # 结束角在 (0, 360] 内，360 表示沿顺时针方向恰好到达正北
+        # （区别于跨越 0° 的扇区，其结束角为小于起始角的正值）
+        unwrapped = self.direction_start + self.direction_width
+        if self.direction_end is None:
+            self.direction_end = unwrapped if unwrapped <= 360.0 + 1e-9 else unwrapped % 360.0
+        else:
+            e = float(self.direction_end) % 360.0
+            if e == 0.0 and abs(unwrapped - 360.0) <= 1e-6:
+                e = 360.0
+            self.direction_end = e
+
+    @property
+    def crosses_zero(self) -> bool:
+        """扇区是否跨越 0°（起始角大于结束角）。整圈单扇区不算跨越。"""
+        return self.direction_start > self.direction_end
 
 
 class WindResource:
     """风资源数据类。
 
     包含按风向扇区划分的风玫瑰数据。
+
+    Parameters
+    ----------
+    sectors : list[WindSector]
+        风向扇区列表
+    source : dict, optional
+        数据来源溯源信息（外部 CSV 导入时生成），含文件路径、指纹、
+        频率归一化策略等；内置风资源为 None
     """
 
-    def __init__(self, sectors: list[WindSector]) -> None:
+    def __init__(self, sectors: list[WindSector], source: Optional[dict] = None) -> None:
         self.sectors = sectors
+        self.source = source
         self._validate()
 
     def _validate(self) -> None:
@@ -111,6 +150,18 @@ class WindResource:
             raise ValueError(
                 f"所有扇区频率之和应为1.0，当前为 {total_freq:.6f}"
             )
+
+    @property
+    def is_external(self) -> bool:
+        """是否来自外部导入数据。"""
+        return self.source is not None
+
+    @property
+    def source_fingerprint(self) -> Optional[str]:
+        """外部数据指纹（SHA-256，前 16 位），内置风资源返回 None。"""
+        if self.source is None:
+            return None
+        return self.source.get("fingerprint")
 
     @property
     def num_sectors(self) -> int:

@@ -1,9 +1,15 @@
 """配置管理模块。
 
 用于从JSON/YAML文件加载配置，或通过命令行参数构建配置。
+
+外部 CSV 数据通过配置引用，相对路径按配置文件所在目录解析：
+
+- ``wind_resource_type: "external"`` + ``wind_resource_params.csv_path``
+- ``turbine_model: "custom"`` + ``custom_turbine``（含曲线 CSV 路径）
 """
 
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Optional, List
 
@@ -17,6 +23,10 @@ from .constraints.boundary import (
     create_rectangular_boundary,
     create_hexagonal_boundary,
     create_irregular_boundary,
+)
+from .io.csv_import import (
+    load_custom_turbine,
+    load_wind_resource_csv,
 )
 
 
@@ -71,13 +81,25 @@ class WindFarmConfig:
         "mean_speed": 8.5,
     })
 
+    # 自定义机组配置（turbine_model 为 "custom" 时使用），曲线 CSV 的相对
+    # 路径按配置文件所在目录解析
+    custom_turbine: Optional[dict] = None
+
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
     economic: EconomicConfig = field(default_factory=EconomicConfig)
 
+    def __post_init__(self) -> None:
+        # 配置文件所在目录，外部 CSV 相对路径的解析基准
+        self._config_dir: Optional[str] = None
+        self._custom_turbine_instance: Optional[Turbine] = None
+
     @classmethod
     def from_json(cls, filepath: str) -> "WindFarmConfig":
-        """从JSON文件加载配置。"""
+        """从JSON文件加载配置。
+
+        外部 CSV 的相对路径以该配置文件所在目录为基准解析。
+        """
         with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
 
@@ -85,7 +107,7 @@ class WindFarmConfig:
         vis_config = VisualizationConfig(**data.get("visualization", {}))
         econ_config = EconomicConfig(**data.get("economic", {}))
 
-        return cls(
+        config = cls(
             n_turbines=data.get("n_turbines", 15),
             turbine_model=data.get("turbine_model", "V126-3.45MW"),
             wake_model=data.get("wake_model", "jensen"),
@@ -95,10 +117,13 @@ class WindFarmConfig:
             boundary_params=data.get("boundary_params", {}),
             wind_resource_type=data.get("wind_resource_type", "default"),
             wind_resource_params=data.get("wind_resource_params", {}),
+            custom_turbine=data.get("custom_turbine"),
             optimization=opt_config,
             visualization=vis_config,
             economic=econ_config,
         )
+        config._config_dir = os.path.dirname(os.path.abspath(filepath))
+        return config
 
     def to_json(self, filepath: str) -> None:
         """保存配置到JSON文件。"""
@@ -112,6 +137,7 @@ class WindFarmConfig:
             "boundary_params": self.boundary_params,
             "wind_resource_type": self.wind_resource_type,
             "wind_resource_params": self.wind_resource_params,
+            "custom_turbine": self.custom_turbine,
             "optimization": self.optimization.__dict__,
             "visualization": self.visualization.__dict__,
             "economic": self.economic.__dict__,
@@ -121,8 +147,23 @@ class WindFarmConfig:
 
     def create_turbines(self) -> list[Turbine]:
         """根据配置创建风机列表。"""
-        turbine = create_default_turbine(self.turbine_model)
+        if self.turbine_model.lower() == "custom":
+            if not self.custom_turbine:
+                raise ValueError(
+                    "turbine_model 为 'custom' 时必须提供 custom_turbine 配置"
+                )
+            turbine = self._create_custom_turbine()
+        else:
+            turbine = create_default_turbine(self.turbine_model)
         return [turbine for _ in range(self.n_turbines)]
+
+    def _create_custom_turbine(self) -> Turbine:
+        """加载（并缓存）自定义机组。"""
+        if self._custom_turbine_instance is None:
+            self._custom_turbine_instance = load_custom_turbine(
+                self.custom_turbine, base_dir=self._config_dir
+            )
+        return self._custom_turbine_instance
 
     def create_wake_model(self) -> WakeModel:
         """根据配置创建尾流模型。"""
@@ -160,18 +201,30 @@ class WindFarmConfig:
     def create_wind_resource(self) -> WindResource:
         """根据配置创建风资源。"""
         wrp = self.wind_resource_params
-        if self.wind_resource_type.lower() == "default":
+        wtype = self.wind_resource_type.lower()
+        if wtype == "default":
             return create_default_wind_resource(
                 num_sectors=wrp.get("num_sectors", 12),
                 dominant_direction=wrp.get("dominant_direction", 270.0),
                 mean_speed=wrp.get("mean_speed", 8.5),
             )
-        elif self.wind_resource_type.lower() == "uniform":
+        elif wtype == "uniform":
             from .core.wind_resource import create_simple_wind_resource
             return create_simple_wind_resource(
                 num_sectors=wrp.get("num_sectors", 12),
                 uniform=True,
                 mean_speed=wrp.get("mean_speed", 8.0),
+            )
+        elif wtype == "external":
+            csv_path = wrp.get("csv_path")
+            if not csv_path:
+                raise ValueError(
+                    "external 风资源需要在 wind_resource_params.csv_path 中指定扇区表文件"
+                )
+            return load_wind_resource_csv(
+                csv_path,
+                frequency_normalization=wrp.get("frequency_normalization", "strict"),
+                base_dir=self._config_dir,
             )
         else:
             raise ValueError(f"未知的风资源类型: {self.wind_resource_type}")

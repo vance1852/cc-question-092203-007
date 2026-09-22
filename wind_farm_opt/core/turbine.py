@@ -18,10 +18,13 @@ class Turbine:
         轮毂高度 (m)
     rotor_diameter : float
         转子直径 (m)
-    thrust_coefficient : float
-        推力系数 Ct (0-1)
+    thrust_coefficient : float, optional
+        恒定推力系数 Ct (0, 1)。当提供 ``thrust_curve`` 时可为 None。
     power_curve : np.ndarray
         功率曲线，形状为 (N, 2)，第一列为风速 (m/s)，第二列为功率 (kW)
+    thrust_curve : np.ndarray, optional
+        随风速变化的推力系数曲线，形状为 (M, 2)，第一列为风速 (m/s)，
+        第二列为推力系数 Ct。风速范围之外按首值/0 外延。
     cut_in_speed : float
         切入风速 (m/s)，从功率曲线自动推断
     rated_speed : float
@@ -37,9 +40,11 @@ class Turbine:
     name: str
     hub_height: float
     rotor_diameter: float
-    thrust_coefficient: float
-    power_curve: np.ndarray
+    thrust_coefficient: Optional[float] = None
+    power_curve: Optional[np.ndarray] = None
     position: Optional[Tuple[float, float]] = None
+    thrust_curve: Optional[np.ndarray] = None
+    source: Optional[dict] = None
 
     cut_in_speed: float = field(init=False)
     rated_speed: float = field(init=False)
@@ -51,10 +56,41 @@ class Turbine:
         if self.power_curve.ndim != 2 or self.power_curve.shape[1] != 2:
             raise ValueError("功率曲线必须是形状为 (N, 2) 的数组")
 
+        self._validate_monotonic_speed(self.power_curve, "功率曲线")
+        if np.any(self.power_curve[:, 1] < 0.0):
+            raise ValueError("功率曲线中的功率不能为负值")
+
         self._derive_parameters()
 
-        if not (0.0 < self.thrust_coefficient <= 1.0):
-            raise ValueError(f"推力系数必须在 (0, 1] 范围内，当前为 {self.thrust_coefficient}")
+        if self.thrust_curve is not None:
+            self.thrust_curve = np.asarray(self.thrust_curve, dtype=np.float64)
+            if self.thrust_curve.ndim != 2 or self.thrust_curve.shape[1] != 2:
+                raise ValueError("推力系数曲线必须是形状为 (M, 2) 的数组")
+            self._validate_monotonic_speed(self.thrust_curve, "推力系数曲线")
+            ct = self.thrust_curve[:, 1]
+            if np.any(ct < 0.0) or np.any(ct >= 1.0):
+                raise ValueError("推力系数曲线中的 Ct 必须在 [0, 1) 范围内")
+        elif self.thrust_coefficient is None:
+            raise ValueError("必须提供恒定推力系数 thrust_coefficient 或推力系数曲线 thrust_curve")
+
+        if self.thrust_coefficient is not None and not (0.0 < self.thrust_coefficient < 1.0):
+            raise ValueError(
+                f"推力系数必须在 (0, 1) 范围内，当前为 {self.thrust_coefficient}"
+            )
+
+    @staticmethod
+    def _validate_monotonic_speed(curve: np.ndarray, label: str) -> None:
+        """校验曲线风速列严格单调递增。"""
+        ws = curve[:, 0]
+        if len(ws) < 2:
+            raise ValueError(f"{label}至少需要两个数据点")
+        diff = np.diff(ws)
+        if np.any(diff <= 0.0):
+            bad = int(np.argmax(diff <= 0.0)) + 1
+            raise ValueError(
+                f"{label}的风速必须严格单调递增：第 {bad + 1} 个点 "
+                f"({ws[bad]:g} m/s) 不大于前一点 ({ws[bad - 1]:g} m/s)"
+            )
 
     def _derive_parameters(self) -> None:
         """从功率曲线推导出切入、额定、切出风速和额定功率。"""
@@ -75,6 +111,41 @@ class Turbine:
             self.rated_speed = float(ws[np.argmax(pw)])
 
         self.cut_out_speed = float(ws[-1])
+
+    @property
+    def has_thrust_curve(self) -> bool:
+        """是否使用随风速变化的推力系数曲线。"""
+        return self.thrust_curve is not None
+
+    def thrust_coefficient_at(self, wind_speed: float | np.ndarray) -> float | np.ndarray:
+        """查询给定风速下的推力系数。
+
+        有推力曲线时线性插值；低于曲线起点取首值，高于终点取 0（切出停机）。
+        无曲线时返回恒定推力系数。
+
+        Parameters
+        ----------
+        wind_speed : float | np.ndarray
+            风速 (m/s)
+
+        Returns
+        -------
+        float | np.ndarray
+            推力系数，标量输入返回 float，数组输入返回数组
+        """
+        ws = np.asarray(wind_speed, dtype=np.float64)
+        if self.thrust_curve is not None:
+            result = np.interp(
+                ws,
+                self.thrust_curve[:, 0],
+                self.thrust_curve[:, 1],
+                left=float(self.thrust_curve[0, 1]),
+                right=0.0,
+            )
+        else:
+            result = np.full_like(ws, self.thrust_coefficient)
+
+        return float(result) if ws.ndim == 0 else result
 
     def power(self, wind_speed: float | np.ndarray) -> float | np.ndarray:
         """根据风速计算功率。

@@ -98,15 +98,17 @@ class JensenWake(WakeModel):
     ) -> float | np.ndarray:
         dist = np.asarray(distance, dtype=np.float64)
         d0 = rotor_diameter
+        ct = np.asarray(thrust_coefficient, dtype=np.float64)
 
         with np.errstate(divide="ignore", invalid="ignore"):
             ratio = d0 / (d0 + 2.0 * self.wake_decay * dist)
-            deficit = 1.0 - np.sqrt(1.0 - thrust_coefficient) * ratio ** 2
+            deficit = 1.0 - np.sqrt(1.0 - ct) * ratio ** 2
 
         deficit = np.where(dist <= 0, 0.0, deficit)
         deficit = np.clip(deficit, 0.0, 1.0)
 
-        return deficit if dist.ndim > 0 else float(deficit)
+        scalar_out = dist.ndim == 0 and np.ndim(d0) == 0 and ct.ndim == 0
+        return float(deficit) if scalar_out else deficit
 
     def wake_radius(
         self,
@@ -150,7 +152,7 @@ class GaussianWake(WakeModel):
     ) -> float | np.ndarray:
         dist = np.asarray(distance, dtype=np.float64)
         d0 = rotor_diameter
-        ct = thrust_coefficient
+        ct = np.asarray(thrust_coefficient, dtype=np.float64)
 
         beta = 0.5 * (1.0 + np.sqrt(1.0 - ct)) / np.sqrt(1.0 - ct)
 
@@ -171,7 +173,8 @@ class GaussianWake(WakeModel):
         peak_deficit = np.where(dist <= 0, 0.0, peak_deficit)
         peak_deficit = np.clip(peak_deficit, 0.0, 1.0)
 
-        return peak_deficit if dist.ndim > 0 else float(peak_deficit)
+        scalar_out = dist.ndim == 0 and np.ndim(d0) == 0 and ct.ndim == 0
+        return float(peak_deficit) if scalar_out else peak_deficit
 
     def wake_radius(
         self,

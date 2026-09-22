@@ -130,12 +130,26 @@ class AEPCalculator:
 
         self._turbine_names = [t.name for t in turbines]
         self._rotor_diameters = np.array([t.rotor_diameter for t in turbines], dtype=np.float64)
-        self._thrust_coefficients = np.array([t.thrust_coefficient for t in turbines], dtype=np.float64)
+        # 恒定 Ct 仅用于无推力曲线的机组与外部接口；逐风速 Ct 见 _thrust_lookup
+        self._thrust_coefficients = np.array(
+            [
+                t.thrust_coefficient
+                if t.thrust_coefficient is not None
+                else float(np.mean(t.thrust_coefficient_at(self._speed_centers)))
+                for t in turbines
+            ],
+            dtype=np.float64,
+        )
         self._rated_powers = np.array([t.rated_power for t in turbines], dtype=np.float64)
         self._power_curves = [t.power_curve for t in turbines]
         self._hub_heights = np.array([t.hub_height for t in turbines], dtype=np.float64)
 
         self._precompute_power_lookups()
+        self._precompute_thrust_lookups()
+
+        # 仅当任一机组提供推力系数曲线时才逐风速 bin 计算 Ct；
+        # 全部为恒定 Ct 时保持原有的标量快速路径
+        self._has_thrust_curve = any(t.has_thrust_curve for t in turbines)
 
     def _precompute_power_lookups(self) -> None:
         """预计算每台风机的功率查找表。"""
@@ -147,12 +161,22 @@ class AEPCalculator:
         for i, turb in enumerate(self.turbines):
             self._power_lookup[i] = turb.power(self._speed_centers)
 
+    def _precompute_thrust_lookups(self) -> None:
+        """预计算每台风机在各风速 bin 处的推力系数 Ct，形状 (N_turb, N_speed)。"""
+        n_turb = len(self.turbines)
+        n_speed = len(self._speed_centers)
+
+        self._thrust_lookup = np.zeros((n_turb, n_speed), dtype=np.float64)
+        for i, turb in enumerate(self.turbines):
+            self._thrust_lookup[i] = turb.thrust_coefficient_at(self._speed_centers)
+
     def _compute_wake_deficit_field(
         self,
         positions: np.ndarray,
         wind_direction: float,
+        per_speed: bool = False,
     ) -> np.ndarray:
-        """计算给定风向下，每台风机在每个风速bin处的速度亏损。
+        """计算给定风向下的速度亏损。
 
         Parameters
         ----------
@@ -160,11 +184,15 @@ class AEPCalculator:
             风机位置 (N_turb, 2)
         wind_direction : float
             风向 (度)
+        per_speed : bool
+            为 True 时返回形状 (N_turb, N_speed) 的逐风速 bin 亏损，
+            上游风机使用推力系数曲线在各自由来流风速下的 Ct；
+            为 False（默认）时使用平均 Ct，返回 (N_turb,)。
 
         Returns
         -------
         np.ndarray
-            速度亏损数组 (N_turb,)，每个元素为该风机在该风向下的等效速度亏损
+            速度亏损数组
         """
         n = positions.shape[0]
 
@@ -197,15 +225,27 @@ class AEPCalculator:
             self._rotor_diameters[:, np.newaxis],
         )
 
-        peak_deficit = self.wake_model.velocity_deficit(
-            downstream_dist,
-            self._rotor_diameters[:, np.newaxis],
-            self._thrust_coefficients[:, np.newaxis],
-        )
+        if per_speed:
+            # 上游风机 i 在各自由来流风速 bin 下的 Ct：(N_up, 1, N_speed)
+            thrust = self._thrust_lookup[:, np.newaxis, :]
+            dist = downstream_dist[:, :, np.newaxis]
+            diameter = self._rotor_diameters[:, np.newaxis, np.newaxis]
+        else:
+            thrust = self._thrust_coefficients[:, np.newaxis]
+            dist = downstream_dist
+            diameter = self._rotor_diameters[:, np.newaxis]
+
+        peak_deficit = self.wake_model.velocity_deficit(dist, diameter, thrust)
 
         radial_factor = self.wake_model.radial_profile(cross_dist, wr)
+        if per_speed:
+            radial_factor = radial_factor[:, :, np.newaxis]
+            mask = downstream_mask[:, :, np.newaxis]
+        else:
+            mask = downstream_mask
+
         deficit_matrix = peak_deficit * radial_factor
-        deficit_matrix = np.where(downstream_mask, deficit_matrix, 0.0)
+        deficit_matrix = np.where(mask, deficit_matrix, 0.0)
 
         total_deficit = superpose_wakes(
             deficit_matrix,
@@ -244,7 +284,9 @@ class AEPCalculator:
         pdf = self.wind_resource.weibull_pdf(self._speed_centers, sector_idx)
         prob = pdf * self.speed_step
 
-        total_deficit = self._compute_wake_deficit_field(positions, wind_dir)
+        total_deficit = self._compute_wake_deficit_field(
+            positions, wind_dir, per_speed=self._has_thrust_curve
+        )
 
         n_turb = len(self.turbines)
         n_speed = len(self._speed_centers)
@@ -322,15 +364,22 @@ class AEPCalculator:
                 cross_dist = dist * np.sqrt(np.clip(1.0 - along_wind ** 2, 0.0, None))
 
                 wr = self.wake_model.wake_radius(downstream_dist, self._rotor_diameters[i])
+
+                # 上游风机 i 的 Ct：有推力曲线时随自由来流风速变化
+                ct_i = (
+                    self._thrust_lookup[i]
+                    if self._has_thrust_curve
+                    else self._thrust_coefficients[i]
+                )
                 peak_def = self.wake_model.velocity_deficit(
                     downstream_dist,
                     self._rotor_diameters[i],
-                    self._thrust_coefficients[i],
+                    ct_i,
                 )
                 radial_factor = self.wake_model.radial_profile(cross_dist, wr)
                 deficit_i_on_j = peak_def * radial_factor
 
-                if deficit_i_on_j <= 0.001:
+                if not np.any(deficit_i_on_j > 0.001):
                     continue
 
                 effective_speeds = self._speed_centers * (1.0 - deficit_i_on_j)
@@ -475,7 +524,9 @@ class AEPCalculator:
             pdf = self.wind_resource.weibull_pdf(self._speed_centers, s_idx)
             prob = pdf * self.speed_step
 
-            total_deficit = self._compute_wake_deficit_field(positions, wind_dir)
+            total_deficit = self._compute_wake_deficit_field(
+                positions, wind_dir, per_speed=self._has_thrust_curve
+            )
 
             effective_speeds = self._speed_centers[np.newaxis, :] * (1.0 - total_deficit[:, np.newaxis])
 

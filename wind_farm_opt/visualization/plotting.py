@@ -198,12 +198,12 @@ def plot_wind_rose(
     norm = Normalize(vmin=np.min(speeds), vmax=np.max(speeds))
     colors = cmap(norm(speeds))
 
-    width = np.deg2rad(wind_resource.sector_widths[0]) * 0.9
+    widths = np.deg2rad(wind_resource.sector_widths) * 0.9
 
     bars = ax.bar(
         angles,
         frequencies,
-        width=width,
+        width=widths,
         bottom=0.0,
         color=colors,
         edgecolor="black",
